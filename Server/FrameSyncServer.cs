@@ -177,13 +177,7 @@ namespace BurstStrike.Net.Server
                 };
                 await transport.SendAsync(joinResult.Encode(), ct);
 
-                // 6) If room transitioned to Countdown, start the room tick thread
-                if (room.State == RoomState.Countdown || room.State == RoomState.Running)
-                {
-                    StartRoomIfNeeded(room, ct);
-                }
-
-                // 7) Enter message receive loop
+                // 6) Enter message receive loop
                 await session.ReceiveLoop(ct);
             }
             catch (EndOfStreamException)
@@ -200,36 +194,6 @@ namespace BurstStrike.Net.Server
                     session.Room.PlayerDisconnected(session);
                 transport?.Disconnect();
             }
-        }
-
-        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool> _roomThreads
-            = new System.Collections.Concurrent.ConcurrentDictionary<string, bool>();
-
-        private void StartRoomIfNeeded(GameRoom room, CancellationToken ct)
-        {
-            if (!_roomThreads.TryAdd(room.RoomId, true))
-                return; // already running
-
-            var thread = new Thread(() =>
-            {
-                try
-                {
-                    room.Run(ct);
-                }
-                catch (Exception ex)
-                {
-                    Log?.Invoke($"[Room {room.RoomId}] Tick thread error: {ex.Message}");
-                }
-                finally
-                {
-                    _roomThreads.TryRemove(room.RoomId, out _);
-                }
-            })
-            {
-                IsBackground = true,
-                Name = $"Room_{room.RoomId}",
-            };
-            thread.Start();
         }
     }
 

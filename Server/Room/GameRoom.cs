@@ -14,14 +14,39 @@ namespace BurstStrike.Net.Server.Room
     /// </summary>
     public enum RoomState : byte
     {
+        /// <summary>Just created, not accepting players yet.</summary>
+        Created = 0,
         /// <summary>Waiting for enough players to join.</summary>
-        Waiting,
-        /// <summary>All slots filled, running countdown before game starts.</summary>
-        Countdown,
+        Waiting = 1,
         /// <summary>Game is running — tick loop active.</summary>
-        Running,
-        /// <summary>Game has ended.</summary>
-        Ended,
+        Running = 2,
+        /// <summary>Room is closing, cleanup in progress.</summary>
+        Closing = 3,
+        /// <summary>Room fully destroyed, will be removed from manager.</summary>
+        Destroyed = 4,
+    }
+
+    /// <summary>
+    /// Room events that drive the state machine.
+    /// </summary>
+    public enum RoomEvent : byte
+    {
+        // ===== Player Events =====
+        PlayerJoin = 0,
+        PlayerLeave = 1,
+        PlayerDisconnect = 2,
+        PlayerReconnect = 3,
+
+        // ===== Game Events =====
+        GameStart = 4,
+        GameEnd = 5,
+
+        // ===== System Events =====
+        Timeout = 6,
+        Shutdown = 7,
+
+        // ===== Error =====
+        Error = 8,
     }
 
     /// <summary>
@@ -59,8 +84,8 @@ namespace BurstStrike.Net.Server.Room
     /// <summary>
     /// A single game room managing lockstep frame synchronization.
     /// 
-    /// Lifecycle:
-    ///   Waiting → (all slots filled) → Countdown → (timer expires) → Running → (game ends) → Ended
+    /// Event-driven state machine:
+    ///   Created → Waiting → Running → Closing → Destroyed
     /// 
     /// During Running state, the room drives a tick clock:
     ///   1. Collect TickInput from all players (or timeout with empty input)
@@ -83,11 +108,11 @@ namespace BurstStrike.Net.Server.Room
         private readonly CommandHistory _history;
         private readonly object _lock = new object();
 
-        private RoomState _state = RoomState.Waiting;
+        private RoomState _state = RoomState.Created;
         private int _playerCount;
         private int _currentTick;
-        private int _countdownRemaining;
-        private int _randomSeed;
+        private CancellationTokenSource _tickCts;
+        private Task _tickLoopTask;
 
         /// <summary>Max ticks to wait for a player's input before advancing with empty input.</summary>
         public int InputTimeoutTicks { get; set; } = 10; // ~333ms at 30 tick/s
@@ -102,14 +127,15 @@ namespace BurstStrike.Net.Server.Room
         /// <summary>Callback for server logging.</summary>
         public Action<string> Log;
 
+        /// <summary>Fired when room transitions to Destroyed state.</summary>
+        public event Action<GameRoom> OnDestroyed;
+
         public GameRoom(string roomId, int maxPlayers = 2, int tickRate = 30, int countdownTicks = 90, int historyCapacity = 18000)
         {
             RoomId = roomId ?? throw new ArgumentNullException(nameof(roomId));
             MaxPlayers = maxPlayers;
             TickRate = tickRate;
             CountdownTicks = countdownTicks;
-            _countdownRemaining = countdownTicks;
-            _randomSeed = Environment.TickCount ^ roomId.GetHashCode();
 
             _slots = new PlayerSlot[maxPlayers];
             for (int i = 0; i < maxPlayers; i++)
@@ -118,11 +144,169 @@ namespace BurstStrike.Net.Server.Room
             _history = new CommandHistory(historyCapacity);
         }
 
+        // ── State Machine Entry Point ───────────────────────────────────
+
+        /// <summary>
+        /// Main event handler for the state machine.
+        /// </summary>
+        public void HandleEvent(RoomEvent evt)
+        {
+            lock (_lock)
+            {
+                if (_state == RoomState.Destroyed)
+                    return;
+
+                switch (_state)
+                {
+                    case RoomState.Created:
+                        OnCreated(evt);
+                        break;
+
+                    case RoomState.Waiting:
+                        OnWaiting(evt);
+                        break;
+
+                    case RoomState.Running:
+                        OnRunning(evt);
+                        break;
+
+                    case RoomState.Closing:
+                        OnClosing(evt);
+                        break;
+                }
+            }
+        }
+
+        // ── State Handlers ───────────────────────────────────────────────
+
+        private void OnCreated(RoomEvent evt)
+        {
+            switch (evt)
+            {
+                case RoomEvent.PlayerJoin:
+                    TransitionTo(RoomState.Waiting);
+                    break;
+
+                case RoomEvent.Shutdown:
+                case RoomEvent.Error:
+                    TransitionTo(RoomState.Closing);
+                    break;
+            }
+        }
+
+        private void OnWaiting(RoomEvent evt)
+        {
+            switch (evt)
+            {
+                case RoomEvent.PlayerJoin:
+                    if (IsFull())
+                        HandleEvent(RoomEvent.GameStart);
+                    break;
+
+                case RoomEvent.PlayerLeave:
+                    if (_playerCount == 0)
+                        TransitionTo(RoomState.Closing);
+                    break;
+
+                case RoomEvent.GameStart:
+                    TransitionTo(RoomState.Running);
+                    break;
+
+                case RoomEvent.Timeout:
+                case RoomEvent.Error:
+                case RoomEvent.Shutdown:
+                    TransitionTo(RoomState.Closing);
+                    break;
+            }
+        }
+
+        private void OnRunning(RoomEvent evt)
+        {
+            switch (evt)
+            {
+                case RoomEvent.GameEnd:
+                    TransitionTo(RoomState.Closing);
+                    break;
+
+                case RoomEvent.PlayerLeave:
+                case RoomEvent.PlayerDisconnect:
+                    if (_playerCount == 0)
+                        TransitionTo(RoomState.Closing);
+                    break;
+
+                case RoomEvent.Timeout:
+                case RoomEvent.Error:
+                case RoomEvent.Shutdown:
+                    TransitionTo(RoomState.Closing);
+                    break;
+            }
+        }
+
+        private void OnClosing(RoomEvent evt)
+        {
+            // Closing state doesn't handle new logic
+        }
+
+        // ── Transition Logic ─────────────────────────────────────────────
+
+        private void TransitionTo(RoomState newState)
+        {
+            if (_state == newState) return;
+
+            var oldState = _state;
+
+            OnExit(oldState);
+
+            _state = newState;
+
+            OnEnter(newState);
+
+            Log?.Invoke($"[Room {RoomId}] {oldState} → {newState}");
+        }
+
+        private void OnEnter(RoomState state)
+        {
+            switch (state)
+            {
+                case RoomState.Waiting:
+                    StartWaitingTimer();
+                    break;
+
+                case RoomState.Running:
+                    StartTick();
+                    break;
+
+                case RoomState.Closing:
+                    StopTick();
+                    Cleanup();
+                    TransitionTo(RoomState.Destroyed);
+                    break;
+
+                case RoomState.Destroyed:
+                    OnDestroyed?.Invoke(this);
+                    break;
+            }
+        }
+
+        private void OnExit(RoomState state)
+        {
+            switch (state)
+            {
+                case RoomState.Waiting:
+                    StopWaitingTimer();
+                    break;
+
+                case RoomState.Running:
+                    StopTick();
+                    break;
+            }
+        }
+
         // ── Player management ────────────────────────────────────────────
 
         /// <summary>
         /// Try to add a player to the room.
-        /// Returns the assigned slot index, or -1 if the room is full.
+        /// Returns the assigned slot index, or -1 if the room is full or not in Waiting state.
         /// </summary>
         public int TryAddPlayer(IClientSession session, int authPlayerId, string playerName)
         {
@@ -144,13 +328,8 @@ namespace BurstStrike.Net.Server.Room
 
                         Log?.Invoke($"[Room {RoomId}] Player '{_slots[i].PlayerName}' joined slot {i} ({_playerCount}/{MaxPlayers})");
 
-                        // Check if room is full → start countdown
-                        if (_playerCount >= MaxPlayers)
-                        {
-                            _state = RoomState.Countdown;
-                            _countdownRemaining = CountdownTicks;
-                            Log?.Invoke($"[Room {RoomId}] Room full. Countdown started ({CountdownTicks} ticks).");
-                        }
+                        // Trigger PlayerJoin event
+                        HandleEvent(RoomEvent.PlayerJoin);
 
                         return i;
                     }
@@ -178,11 +357,13 @@ namespace BurstStrike.Net.Server.Room
                             _slots[i].Session = null;
                             _slots[i].AuthPlayerId = 0;
                             _playerCount--;
+                            HandleEvent(RoomEvent.PlayerLeave);
                         }
                         else if (_state == RoomState.Running)
                         {
                             // Notify others
                             BroadcastExcept(new Messages.PlayerDisconnected { PlayerId = (byte)i }.Encode(), i);
+                            HandleEvent(RoomEvent.PlayerDisconnect);
                         }
                         break;
                     }
@@ -203,6 +384,7 @@ namespace BurstStrike.Net.Server.Room
                         _slots[i].IsConnected = true;
                         Log?.Invoke($"[Room {RoomId}] Player '{_slots[i].PlayerName}' (slot {i}) reconnected.");
                         BroadcastExcept(new Messages.PlayerReconnected { PlayerId = (byte)i }.Encode(), i);
+                        HandleEvent(RoomEvent.PlayerReconnect);
                         return i;
                     }
                 }
@@ -232,18 +414,70 @@ namespace BurstStrike.Net.Server.Room
             }
         }
 
-        // ── Tick loop (called by TickDriver) ─────────────────────────────
+        // ── Tick loop management ─────────────────────────────────────────
+
+        private CancellationTokenSource _waitingTimerCts;
+        private Task _waitingTimerTask;
+
+        private void StartWaitingTimer()
+        {
+            _waitingTimerCts = new CancellationTokenSource();
+            _waitingTimerTask = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(30000, _waitingTimerCts.Token); // 30s timeout
+                    lock (_lock)
+                    {
+                        if (_state == RoomState.Waiting && _playerCount > 0)
+                        {
+                            HandleEvent(RoomEvent.Timeout);
+                        }
+                    }
+                }
+                catch (OperationCanceledException) { }
+            });
+        }
+
+        private void StopWaitingTimer()
+        {
+            _waitingTimerCts?.Cancel();
+            try { _waitingTimerTask?.Wait(1000); }
+            catch (Exception) { /* Task cancellation or timeout */ }
+        }
+
+        private void StartTick()
+        {
+            _tickCts = new CancellationTokenSource();
+            _tickLoopTask = Task.Run(() => TickLoopProc(_tickCts.Token), _tickCts.Token);
+        }
+
+        private void StopTick()
+        {
+            _tickCts?.Cancel();
+            try { _tickLoopTask?.Wait(1000); }
+            catch (Exception) { /* Task cancellation or timeout */ }
+        }
+
+        private void Cleanup()
+        {
+            // Clean up resources
+            _tickCts?.Dispose();
+            _waitingTimerCts?.Dispose();
+        }
+
+        private bool IsFull() => _playerCount >= MaxPlayers;
 
         /// <summary>
         /// Run the room's tick loop. Called from a dedicated thread.
         /// </summary>
-        public void Run(CancellationToken ct)
+        private void TickLoopProc(CancellationToken ct)
         {
             var sw = Stopwatch.StartNew();
             int tickMs = 1000 / TickRate;
             long nextTickTime = sw.ElapsedMilliseconds;
 
-            while (!ct.IsCancellationRequested && _state != RoomState.Ended)
+            while (!ct.IsCancellationRequested && _state != RoomState.Destroyed)
             {
                 long now = sw.ElapsedMilliseconds;
                 if (now < nextTickTime)
@@ -259,40 +493,11 @@ namespace BurstStrike.Net.Server.Room
 
                 lock (_lock)
                 {
-                    switch (_state)
+                    if (_state == RoomState.Running)
                     {
-                        case RoomState.Countdown:
-                            TickCountdown();
-                            break;
-                        case RoomState.Running:
-                            TickRunning();
-                            break;
+                        TickRunning();
                     }
                 }
-            }
-        }
-
-        private void TickCountdown()
-        {
-            _countdownRemaining--;
-            if (_countdownRemaining <= 0)
-            {
-                // Transition to Running
-                _state = RoomState.Running;
-                _currentTick = 0;
-
-                // Broadcast GameStart to all players
-                var gameStart = new Messages.GameStart
-                {
-                    PlayerCount = (byte)MaxPlayers,
-                    TickRate = TickRate,
-                    CountdownTicks = 0,
-                    RandomSeed = _randomSeed,
-                };
-                var payload = gameStart.Encode();
-                BroadcastAll(payload);
-
-                Log?.Invoke($"[Room {RoomId}] Game started! Tick rate={TickRate}");
             }
         }
 

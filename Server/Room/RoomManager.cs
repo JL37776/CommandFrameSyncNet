@@ -106,6 +106,13 @@ namespace BurstStrike.Net.Server.Room
 
             var room = new GameRoom(roomId, DefaultMaxPlayers, DefaultTickRate, DefaultCountdownTicks, DefaultHistoryCapacity);
             room.Log = Log;
+            
+            // Subscribe to destroyed event to auto-cleanup
+            room.OnDestroyed += destroyed =>
+            {
+                RemoveRoom(destroyed.RoomId);
+            };
+            
             _rooms[roomId] = room;
 
             Log?.Invoke($"[RoomManager] Created room '{roomId}' (maxPlayers={DefaultMaxPlayers}, tickRate={DefaultTickRate})");
